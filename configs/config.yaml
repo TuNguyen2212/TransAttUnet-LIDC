@@ -7,12 +7,11 @@ paths:
   raw_data: "data/raw"
   # Đường dẫn đến dữ liệu đã preprocess (chứa subfolder images/ và masks/)
   processed_data: "data/processed"
-
+  
   modal_processed_data: "/mnt/storage/data/processed/"
   
   # File chia tập train/val/test
   split_file: "data/processed/split.json"
-  
   modal_split_file: "/mnt/storage/data/processed/split.json"
 
   # Nơi lưu checkpoints (model đã train) và logs
@@ -26,14 +25,16 @@ data:
   num_classes: 3        # Bài toán 3 lớp (Nodule, vùng phổi và Background)
   num_workers: 4        # Số luồng load dữ liệu
   pin_memory: True      # Tăng tốc load dữ liệu sang GPU
-# Các tham số Preprocessing
+  # Các tham số Preprocessing
   target_spacing: [1.0, 1.0, 1.0]
   window_center: -600
   window_width: 1500
   consensus_level: 0.5
   padding: [[20, 20], [20, 20], [20, 20]] # Lưu ý format list lồng nhau
-  final_size: 512
-  save_negative: False
+  final_size: [128, 128]  # Kích thước crop/rescale ảnh ROI
+  save_negative: False     # Có lưu slice không có nodule hay không
+  num_aug: 3               # Số lần tạo ảnh shift từ 1 slice
+  max_shift: 10             # Số pixel tối đa shift mỗi chiều
 
 model:
   name: "TransAttUnet"
@@ -50,7 +51,8 @@ train:
   # Các siêu tham số (Hyperparameters) theo bài báo
   epochs: 100           # Tổng số vòng train 
   batch_size: 8         # Batch size nhỏ do Transformer tốn bộ nhớ
-  
+  accumulate_steps: 4   # Số step để tích lũy gradient, tăng effective batch size
+
   optimizer:
     name: "AdamW"
     lr: 0.0001

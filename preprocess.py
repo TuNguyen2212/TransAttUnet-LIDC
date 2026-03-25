@@ -58,6 +58,33 @@ def segment_lung_mask(volume):
     return mask.astype(np.uint8)
 
 
+# Cropping
+def crop_and_resize(slice_img, slice_mask, x_s, x_e, y_s, y_e, target_size):
+    roi_img = slice_img[x_s:x_e, y_s:y_e]
+    roi_mask = slice_mask[x_s:x_e, y_s:y_e]
+
+    if roi_img.size == 0:
+        return None, None
+
+    th, tw = target_size
+
+    # Resize image (bilinear)
+    roi_img = scipy.ndimage.zoom(
+        roi_img,
+        (th / roi_img.shape[0], tw / roi_img.shape[1]),
+        order=1
+    )
+
+    # Resize mask (nearest)
+    roi_mask = scipy.ndimage.zoom(
+        roi_mask,
+        (th / roi_mask.shape[0], tw / roi_mask.shape[1]),
+        order=0
+    )
+
+    return roi_img.astype(np.float32), roi_mask.astype(np.uint8)
+
+
 def process_patient_segmentation(args):
     # Bung nén tham số từ main truyền vào
     pid, raw_dir, processed_dir, seg_params = args
@@ -69,42 +96,40 @@ def process_patient_segmentation(args):
 
     stats = {"pid": pid, "slices": 0, "nodules": 0, "success": False, "error": None}
 
+    target_size = seg_params['final_size']  # [H, W]
+    num_aug = seg_params.get('num_aug', 3)  # Số lượng shift augmentation
+    max_shift = seg_params.get('max_shift', 10)  # Số pixel shift tối đa
+
     try:
         vol, spacing, nodules = loader.load_patient_data(pid)
         if vol is None:
             stats["error"] = "Load Failed"
             return stats
 
+        # Phân đoạn phổi
         lung_mask = segment_lung_mask(vol)
 
-        # Sử dụng tham số từ config
+        # Normalize HU
         vol_norm = normalize_hu(vol, seg_params['window_center'], seg_params['window_width'])
 
         valid_nodules = 0
 
         for i, cluster in enumerate(nodules):
-            if len(cluster) < 3: continue
+            if len(cluster) < 3:
+                continue
 
             # Convert padding list từ yaml sang tuple nếu cần thiết cho pylidc
             pad_val = seg_params['padding']
-            # Đảm bảo format đúng cho pylidc [(x,x), (y,y), (z,z)]
             if isinstance(pad_val[0], list):
                 pad_val = [tuple(p) for p in pad_val]
 
             mask_roi, cbbox, _ = consensus(cluster, clevel=seg_params['consensus_level'], pad=pad_val)
-
             z_start = cbbox[2].start
             z_stop = cbbox[2].stop
 
             for z in range(z_start, z_stop):
                 slice_img = vol_norm[z, :, :]
-
-                # multi-class mask
-                # 0 = background
-                # 1 = lung
-                # 2 = nodule
                 slice_mask = np.zeros_like(slice_img, dtype=np.uint8)
-
                 slice_mask[lung_mask[z] > 0] = 1
 
                 z_local = z - z_start
@@ -114,13 +139,13 @@ def process_patient_segmentation(args):
                 y_start, y_stop = cbbox[1].start, cbbox[1].stop
 
                 h_img, w_img = slice_img.shape
-
                 x_s = max(0, x_start)
                 x_e = min(h_img, x_stop)
                 y_s = max(0, y_start)
                 y_e = min(w_img, y_stop)
 
-                if x_s >= x_e or y_s >= y_e: continue
+                if x_s >= x_e or y_s >= y_e:
+                    continue
 
                 roi_x_s = x_s - x_start
                 roi_x_e = roi_x_s + (x_e - x_s)
@@ -128,16 +153,56 @@ def process_patient_segmentation(args):
                 roi_y_e = roi_y_s + (y_e - y_s)
 
                 roi = mask_slice_roi[roi_x_s:roi_x_e, roi_y_s:roi_y_e]
-
                 if roi.shape == (x_e - x_s, y_e - y_s):
                     slice_mask[x_s:x_e, y_s:y_e][roi > 0] = 2
 
-                if np.sum(slice_mask == 2) > 0 or random.random() < 0.05:
-                    file_id = f"{pid}_nodule{i}_slice{z}_{uuid.uuid4().hex[:6]}"
+                # Chỉ lấy slice có nodule
+                if np.sum(slice_mask == 2) > 0 or seg_params.get('save_negative', False):
+                    roi_img = slice_img[x_s:x_e, y_s:y_e]
+                    roi_mask = slice_mask[x_s:x_e, y_s:y_e]
 
-                    np.save(os.path.join(img_dir, f"{file_id}.npy"), slice_img)
-                    np.save(os.path.join(mask_dir, f"{file_id}.npy"), slice_mask)
-                    stats["slices"] += 1
+                    if roi_img.shape[0] < 5 or roi_img.shape[1] < 5:
+                        continue
+
+                    # ----- TẠO SHIFT AUGMENTATION -----
+                    for aug_idx in range(num_aug):
+                        dx = random.randint(-max_shift, max_shift)
+                        dy = random.randint(-max_shift, max_shift)
+
+                        x_s_new = max(0, x_s + dx)
+                        y_s_new = max(0, y_s + dy)
+                        x_e_new = min(h_img, x_e + dx)
+                        y_e_new = min(w_img, y_e + dy)
+
+                        roi_img_shift = slice_img[x_s_new:x_e_new, y_s_new:y_e_new]
+                        roi_mask_shift = slice_mask[x_s_new:x_e_new, y_s_new:y_e_new]
+
+                        if roi_img_shift.shape[0] < 5 or roi_img_shift.shape[1] < 5:
+                            continue
+
+                        # Resize về final_size
+                        roi_img_resized = scipy.ndimage.zoom(
+                            roi_img_shift,
+                            (target_size[0] / roi_img_shift.shape[0],
+                             target_size[1] / roi_img_shift.shape[1]),
+                            order=1
+                        )
+                        roi_mask_resized = scipy.ndimage.zoom(
+                            roi_mask_shift,
+                            (target_size[0] / roi_mask_shift.shape[0],
+                             target_size[1] / roi_mask_shift.shape[1]),
+                            order=0
+                        )
+
+                        roi_img_resized = roi_img_resized.astype(np.float32)
+                        roi_mask_resized = roi_mask_resized.astype(np.uint8)
+
+                        # Save file với suffix _aug{aug_idx}
+                        file_id = f"{pid}_nodule{i}_slice{z}_aug{aug_idx}_{uuid.uuid4().hex[:6]}"
+                        np.save(os.path.join(img_dir, f"{file_id}.npy"), roi_img_resized)
+                        np.save(os.path.join(mask_dir, f"{file_id}.npy"), roi_mask_resized)
+
+                        stats["slices"] += 1
 
             valid_nodules += 1
 
@@ -147,7 +212,7 @@ def process_patient_segmentation(args):
         else:
             stats["error"] = "No valid nodules"
 
-    except Exception as e:
+    except Exception:
         import traceback
         stats["error"] = traceback.format_exc()
 

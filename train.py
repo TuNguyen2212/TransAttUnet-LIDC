@@ -11,32 +11,37 @@ from src.loss import TransAttLoss
 from src.utils import load_config, set_seed, calculate_metrics, AverageMeter
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def train_one_epoch(model, loader, criterion, optimizer, device, accumulation_steps=1):
+    """
+    Huấn luyện 1 epoch với gradient accumulation nếu accumulation_steps > 1
+    """
     model.train()
     loss_meter = AverageMeter()
     dice_meter = AverageMeter()
 
+    optimizer.zero_grad()
     pbar = tqdm(loader, desc="Training", leave=False)
 
-    for images, masks in pbar:
+    for step, (images, masks) in enumerate(pbar, 1):
         images = images.to(device)
-        masks = masks.to(device)
-
-        masks = masks.squeeze(1).long()  # loại channel singleton
+        masks = masks.to(device).squeeze(1).long()  # loại channel singleton
 
         outputs = model(images)
-
-        # ===== Lấy loss và Dice, kèm loss từng class =====
         loss, dice_score, class_losses = criterion(outputs, masks, return_class_losses=True)
 
-        optimizer.zero_grad()
+        # Scale loss cho accumulation
+        loss = loss / accumulation_steps
         loss.backward()
-        optimizer.step()
 
-        loss_meter.update(loss.item(), images.size(0))
+        if step % accumulation_steps == 0 or step == len(loader):
+            optimizer.step()
+            optimizer.zero_grad()
+
+        # Cập nhật metrics
+        loss_meter.update(loss.item() * accumulation_steps, images.size(0))  # scale lại
         dice_meter.update(dice_score.item(), images.size(0))
 
-        # In loss từng class
+        # Hiển thị loss từng class
         class_loss_str = ", ".join([f"{l:.4f}" for l in class_losses])
         pbar.set_postfix({
             "Loss": f"{loss_meter.avg:.4f}",
@@ -50,7 +55,6 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
 def validate(model, loader, criterion, device):
     model.eval()
     loss_meter = AverageMeter()
-
     metrics_meters = {
         "dice": AverageMeter(),
         "iou": AverageMeter(),
@@ -59,22 +63,15 @@ def validate(model, loader, criterion, device):
         "precision": AverageMeter()
     }
 
-    num_classes = 3  # hoặc cfg
+    num_classes = 3
     class_dice_meters = [AverageMeter() for _ in range(num_classes)]
 
     with torch.no_grad():
-        for i, (images, masks) in tqdm(enumerate(loader), desc="Validating", leave=False):
+        for i, (images, masks) in enumerate(tqdm(loader, desc="Validating", leave=False)):
             images = images.to(device)
-            masks = masks.to(device)
-
-            masks = masks.squeeze(1).long()
+            masks = masks.to(device).squeeze(1).long()
 
             outputs = model(images)
-
-            # ===== DEBUG PROBABILITY =====
-            if i == 0:
-                probs = torch.softmax(outputs, dim=1)
-                print(f"\n[DEBUG] Max prob: {probs.max().item():.4f}")
 
             # ===== LOSS =====
             loss, dice_score, class_losses = criterion(outputs, masks, return_class_losses=True)
@@ -82,19 +79,16 @@ def validate(model, loader, criterion, device):
 
             # ===== METRICS =====
             scores = calculate_metrics(outputs, masks)
-
             for k in metrics_meters.keys():
                 metrics_meters[k].update(scores[k], images.size(0))
 
-            # ===== UPDATE CLASS DICE =====
             for cls_idx, d in enumerate(scores['dice_per_class']):
                 class_dice_meters[cls_idx].update(d, images.size(0))
 
-            # ===== DEBUG batch đầu =====
+            # Debug batch đầu
             if i == 0:
                 class_loss_str = ", ".join([f"{l:.4f}" for l in class_losses])
                 class_dice_str = ", ".join([f"{d:.4f}" for d in scores['dice_per_class']])
-
                 print(f"[DEBUG] Class Losses: {class_loss_str}")
                 print(f"[DEBUG] Dice per class: {class_dice_str}")
 
@@ -127,17 +121,22 @@ def main():
     device = torch.device(cfg['train']['device'] if torch.cuda.is_available() else "cpu")
     print(f"Training on: {device}")
 
-    # ===== DATA =====
+    # ===== DATASET =====
+    # Đọc final_size từ config (final_size trong preprocessing)
+    final_size = tuple(cfg['data']['final_size'])
+
     train_ds = TransAttUnetDataset(
         cfg['paths']['modal_processed_data'],
         cfg['paths']['modal_split_file'],
-        mode='train'
+        mode='train',
+        final_size=final_size
     )
 
     val_ds = TransAttUnetDataset(
         cfg['paths']['modal_processed_data'],
         cfg['paths']['modal_split_file'],
-        mode='val'
+        mode='val',
+        final_size=final_size
     )
 
     train_loader = DataLoader(
@@ -145,7 +144,7 @@ def main():
         batch_size=cfg['train']['batch_size'],
         shuffle=True,
         num_workers=cfg['data']['num_workers'],
-        pin_memory=True
+        pin_memory=cfg['data'].get('pin_memory', True)
     )
 
     val_loader = DataLoader(
@@ -153,7 +152,7 @@ def main():
         batch_size=cfg['train']['batch_size'],
         shuffle=False,
         num_workers=cfg['data']['num_workers'],
-        pin_memory=True
+        pin_memory=cfg['data'].get('pin_memory', True)
     )
 
     # ===== MODEL =====
@@ -163,8 +162,8 @@ def main():
     ).to(device)
 
     # ===== LOSS (có weight) =====
-    class_weights = cfg['train']['loss'].get('class_weights', [0.2, 0.3, 0.5])
-    class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    class_weights = torch.tensor(cfg['train']['loss'].get('class_weights', [0.2, 0.3, 0.5]),
+                                 dtype=torch.float32).to(device)
 
     criterion = TransAttLoss(
         alpha=cfg['train']['loss']['alpha'],
@@ -194,21 +193,22 @@ def main():
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
         start_epoch = checkpoint['epoch'] + 1
         best_dice = checkpoint['best_dice']
-
         print(f"Resumed from epoch {checkpoint['epoch']} | Best Dice: {best_dice:.4f}")
 
     # ===== TRAIN =====
     patience = cfg['train'].get('early_stopping', 20)
     no_improve_count = 0
 
+    # ----- gradient accumulation -----
+    accumulation_steps = cfg['train'].get('accumulation_steps', 1)
+
     for epoch in range(start_epoch, cfg['train']['epochs'] + 1):
         print(f"\nEpoch [{epoch}]")
 
         train_loss, train_dice, train_class_losses = train_one_epoch(
-            model, train_loader, criterion, optimizer, device
+            model, train_loader, criterion, optimizer, device, accumulation_steps=accumulation_steps
         )
 
         val_loss, val_metrics = validate(
@@ -219,7 +219,6 @@ def main():
 
         print(f"Train Loss: {train_loss:.4f} | Dice: {train_dice:.4f}")
         print(f"Val Loss:   {val_loss:.4f} | Dice: {val_metrics['dice']:.4f}")
-
         class_dice_str = ", ".join([f"{d:.4f}" for d in val_metrics['dice_per_class']])
         print(f"Val Dice per class: {class_dice_str}")
 
